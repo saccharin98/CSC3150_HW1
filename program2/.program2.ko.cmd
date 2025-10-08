@@ -1,0 +1,1 @@
+cmd_/home/vagrant/csc3150/source/program2/program2.ko := ld -r -m elf_x86_64  -z max-page-size=0x200000 -z noexecstack   --build-id  -T ./scripts/module-common.lds -o /home/vagrant/csc3150/source/program2/program2.ko /home/vagrant/csc3150/source/program2/program2.o /home/vagrant/csc3150/source/program2/program2.mod.o;  true

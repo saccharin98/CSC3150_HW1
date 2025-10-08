@@ -22,7 +22,7 @@ MODULE_LICENSE("GPL");
  *
  *     sudo insmod program2.ko user_prog=/path/to/test
  */
-static char *user_prog = "/workspace/CSC3150_HW1/program2/test";
+static char *user_prog = "/home/vagrant/csc3150/source/program2/test";
 module_param(user_prog, charp, 0644);
 MODULE_PARM_DESC(user_prog, "Absolute path of the user-space test program");
 
