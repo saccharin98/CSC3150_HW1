@@ -1,130 +1,211 @@
 #include <linux/module.h>
-#include <linux/moduleparam.h>
+#include <linux/atomic.h>
+#include <linux/err.h>
+#include <linux/fs.h>
+#include <linux/kernel.h>
+#include <linux/kmod.h>
+#include <linux/kthread.h>
+#include <linux/pid.h>
+#include <linux/printk.h>
 #include <linux/sched.h>
 #include <linux/sched/signal.h>
 #include <linux/signal.h>
-#include <linux/pid.h>
-#include <linux/kthread.h>
-#include <linux/kernel.h>
-#include <linux/err.h>
-#include <linux/slab.h>
-#include <linux/string.h>
-#include <linux/printk.h>
-#include <linux/jiffies.h>
-#include <linux/kmod.h>
-#include <linux/fs.h>
 
 MODULE_LICENSE("GPL");
 
-/*
- * Path of the user-space test program.  The default value can be
- * overridden at module loading time, e.g.:
- *
- *     sudo insmod program2.ko user_prog=/path/to/test
- */
-static char *user_prog = "/home/vagrant/csc3150/source/program2/test";
-module_param(user_prog, charp, 0644);
-MODULE_PARM_DESC(user_prog, "Absolute path of the user-space test program");
+#define TEST_PATH "/tmp/test"
 
-#define UMH_WTERMSIG(status) ((status) & 0x7f)
-#define UMH_WCOREDUMP(status) ((status) & 0x80)
-#define UMH_WEXITSTATUS(status) (((status) >> 8) & 0xff)
-#define UMH_WSTOPSIG(status) UMH_WEXITSTATUS(status)
-#define UMH_WIFEXITED(status) (UMH_WTERMSIG(status) == 0)
-#define UMH_WIFSTOPPED(status) (((status) & 0xff) == 0x7f)
-#define UMH_WIFCONTINUED(status) ((status) == 0xffff)
-#define UMH_WIFSIGNALED(status) \
-        (!(UMH_WIFEXITED(status) || UMH_WIFSTOPPED(status) || \
-           UMH_WIFCONTINUED(status)))
+static struct task_struct *worker;
+static atomic_t child_pid = ATOMIC_INIT(-1);
+
+struct child_info {
+        pid_t pid;
+};
+
+static const char *signal_to_name(int sig)
+{
+        switch (sig) {
+        case SIGHUP:  return "SIGHUP";
+        case SIGINT:  return "SIGINT";
+        case SIGQUIT: return "SIGQUIT";
+        case SIGILL:  return "SIGILL";
+        case SIGTRAP: return "SIGTRAP";
+        case SIGABRT: return "SIGABRT";
+        case SIGBUS:  return "SIGBUS";
+        case SIGFPE:  return "SIGFPE";
+        case SIGKILL: return "SIGKILL";
+        case SIGUSR1: return "SIGUSR1";
+        case SIGSEGV: return "SIGSEGV";
+        case SIGUSR2: return "SIGUSR2";
+        case SIGPIPE: return "SIGPIPE";
+        case SIGALRM: return "SIGALRM";
+        case SIGTERM: return "SIGTERM";
+        case SIGCHLD: return "SIGCHLD";
+        case SIGCONT: return "SIGCONT";
+        case SIGSTOP: return "SIGSTOP";
+        case SIGTSTP: return "SIGTSTP";
+        case SIGTTIN: return "SIGTTIN";
+        case SIGTTOU: return "SIGTTOU";
+        default:      return "UNKNOWN";
+        }
+}
+
+static void reset_sigaction(struct task_struct *task)
+{
+        int i;
+        struct k_sigaction *ka;
+
+        if (!task->sighand)
+                return;
+
+        ka = &task->sighand->action[0];
+        for (i = 0; i < _NSIG; i++, ka++) {
+                ka->sa.sa_handler = SIG_DFL;
+                ka->sa.sa_flags = 0;
+                ka->sa.sa_restorer = NULL;
+                sigemptyset(&ka->sa.sa_mask);
+        }
+}
+
+static void translate_wait(int status, bool *exited, int *exit_code,
+                           bool *signaled, int *term_sig,
+                           bool *stopped, int *stop_sig)
+{
+        int sig = status & 0x7f;
+
+        *exited = *signaled = *stopped = false;
+        *exit_code = *term_sig = *stop_sig = 0;
+
+        if (sig == 0) {
+                *exited = true;
+                *exit_code = (status >> 8) & 0xff;
+                return;
+        }
+
+        if (sig == 0x7f) {
+                *stopped = true;
+                *stop_sig = (status >> 8) & 0xff;
+                return;
+        }
+
+        *signaled = true;
+        *term_sig = sig;
+}
+
+static int helper_init(struct subprocess_info *info, struct cred *new)
+{
+        struct child_info *data = info->data;
+        pid_t pid = task_pid_nr(current);
+
+        if (data)
+                data->pid = pid;
+
+        atomic_set(&child_pid, pid);
+        return 0;
+}
 
 
-//implement fork function
-int my_fork(void *argc){
-        char *path = argc;
-        char *argv[2];
-        static char *const envp[] = {
+static int run_user_process(void *unused)
+{
+        char *argv[] = { (char *)TEST_PATH, NULL };
+        char *envp[] = {
                 "HOME=/",
-                "TERM=linux",
                 "PATH=/sbin:/bin:/usr/sbin:/usr/bin",
                 NULL,
         };
-        int status = 0;
+        struct subprocess_info *info;
+        struct child_info ctx;
+        int ret;
+        int status;
+        bool exited, signaled, stopped;
+        int exit_code, term_sig, stop_sig;
+        pid_t child;
 
-        if (!path || !*path) {
-                pr_err("[program2] : invalid user program path\n");
-                goto out_free;
+        pr_info("[program2] : module_init kthread start\n");
+
+        ctx.pid = -1;
+        atomic_set(&child_pid, -1);
+
+        reset_sigaction(current);
+
+        info = call_usermodehelper_setup(argv[0], argv, envp,
+                                         GFP_KERNEL,
+                                         helper_init,
+                                         NULL,
+                                         &ctx);
+        if (!info) {
+                pr_err("[program2] : failed to setup usermodehelper\n");
+                return -ENOMEM;
         }
 
-        //set default sigaction for current process
-        int i;
-        struct k_sigaction *k_action = &current->sighand->action[0];
-        for(i=0;i<_NSIG;i++){
-                k_action->sa.sa_handler = SIG_DFL;
-                k_action->sa.sa_flags = 0;
-                k_action->sa.sa_restorer = NULL;
-                sigemptyset(&k_action->sa.sa_mask);
-                k_action++;
+        ret = call_usermodehelper_exec(info, UMH_WAIT_PROC);
+
+        child = ctx.pid;
+        atomic_set(&child_pid, -1);
+
+        pr_info("[program2] : The child process has pid = %d\n", child);
+        pr_info("[program2] : This is the parent process, pid = %d\n", current->pid);
+        pr_info("[program2] : child process\n");
+
+        if (ret < 0) {
+                pr_err("[program2] : exec failed, rc = %d\n", ret);
+                return ret;
         }
 
-        argv[0] = path;
-        argv[1] = NULL;
+        status = ret;
+        translate_wait(status, &exited, &exit_code, &signaled, &term_sig,
+                       &stopped, &stop_sig);
 
-        status = call_usermodehelper(path, argv, (char **)envp, UMH_WAIT_PROC);
-        if (status < 0) {
-                pr_err("[program2] : failed to execute %s (err=%d)\n", path, status);
-                goto out_free;
-        }
-
-        if (UMH_WIFEXITED(status)) {
-                pr_info("[program2] : child exited with status %d\n",
-                        UMH_WEXITSTATUS(status));
-        } else if (UMH_WIFSIGNALED(status)) {
-                pr_info("[program2] : child terminated by signal %d%s\n",
-                        UMH_WTERMSIG(status),
-                        UMH_WCOREDUMP(status) ? " (core dumped)" : "");
-        } else if (UMH_WIFSTOPPED(status)) {
-                pr_info("[program2] : child stopped by signal %d\n",
-                        UMH_WSTOPSIG(status));
-        } else if (UMH_WIFCONTINUED(status)) {
-                pr_info("[program2] : child continued\n");
+        if (signaled) {
+                pr_info("[program2] : get %s signal\n", signal_to_name(term_sig));
+                pr_info("[program2] : child process terminated\n");
+                pr_info("[program2] : The return signal is %d\n", term_sig);
+        } else if (stopped) {
+                pr_info("[program2] : child process stopped by %s\n",
+                        signal_to_name(stop_sig));
+        } else if (exited) {
+                pr_info("[program2] : child process exited normally\n");
+                pr_info("[program2] : The return code is %d\n", exit_code);
         } else {
-                pr_info("[program2] : child finished with status 0x%x\n", status);
+                pr_info("[program2] : unknown child state (status=0x%x)\n", status);
         }
 
-out_free:
-        kfree(path);
         return 0;
 }
 
 static int __init program2_init(void){
+        int err;
 
-        printk("[program2] : Module_init\n");
+        pr_info("[program2] : module_init\n");
+        worker = kthread_run(run_user_process, NULL, "program2_worker");
+        pr_info("[program2] : module_init create kthread start\n");
 
-        /* create a kernel thread to run my_fork */
-        {
-                struct task_struct *task;
-                char *path_copy;
-
-                path_copy = kstrdup(user_prog, GFP_KERNEL);
-                if (!path_copy) {
-                        pr_err("[program2] : failed to allocate memory for path\n");
-                        return -ENOMEM;
-                }
-
-                task = kthread_run(my_fork, path_copy, "program2_fork");
-                if (IS_ERR(task)) {
-                        pr_err("[program2] : failed to create kernel thread (%ld)\n",
-                               PTR_ERR(task));
-                        kfree(path_copy);
-                        return PTR_ERR(task);
-                }
+        if (IS_ERR(worker)) {
+                err = PTR_ERR(worker);
+                pr_err("[program2] : kthread_run failed: %d\n", err);
+                return err;
         }
 
         return 0;
 }
 
 static void __exit program2_exit(void){
-	printk("[program2] : Module_exit\n");
+        pid_t pid = atomic_read(&child_pid);
+
+        if (pid > 0) {
+                struct pid *task_pid = find_vpid(pid);
+
+                if (task_pid) {
+                        pr_info("[program2] : module_exit kill child pid=%d\n", pid);
+                        kill_pid(task_pid, SIGKILL, 1);
+                }
+                atomic_set(&child_pid, -1);
+        }
+
+        if (worker && !IS_ERR(worker))
+                kthread_stop(worker);
+
+        pr_info("[program2] : module_exit./my\n");
 }
 
 module_init(program2_init);
