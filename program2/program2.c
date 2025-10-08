@@ -13,6 +13,7 @@
 #include <linux/jiffies.h>
 #include <linux/kmod.h>
 #include <linux/fs.h>
+#include <linux/namei.h>
 
 MODULE_LICENSE("GPL");
 
@@ -23,7 +24,7 @@ MODULE_LICENSE("GPL");
  *
  *     sudo insmod program2.ko user_prog=/absolute/path/to/test
  */
-static char *user_prog = "/home/vagrant/csc3150/source/program2/test";
+static char *user_prog = "/workspace/CSC3150_HW1/program2/test";
 module_param(user_prog, charp, 0644);
 MODULE_PARM_DESC(user_prog, "Absolute path of the user-space test program");
 
@@ -69,6 +70,21 @@ int my_fork(void *argc){
 
         argv[0] = path;
         argv[1] = NULL;
+
+        {
+                struct path user_path;
+                int err;
+
+                err = kern_path(path, LOOKUP_FOLLOW, &user_path);
+                if (err) {
+                        pr_err("[program2] : failed to resolve %s (err=%d)\n",
+                               path, err);
+                        goto out_free;
+                }
+                path_put(&user_path);
+        }
+
+        pr_info("[program2] : launching %s\n", path);
 
         status = call_usermodehelper(path, argv, (char **)envp, UMH_WAIT_PROC);
         if (status < 0) {
